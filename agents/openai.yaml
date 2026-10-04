@@ -1,0 +1,7 @@
+interface:
+  display_name: "hand-off"
+  short_description: "先选择设备或对话场景，提醒模型与强度，整理交接并输出清晰接管报告"
+  default_prompt: "使用 $hand-off，先让我选择设备交接或对话交接，提醒推荐的主代理模型与推理强度，再执行对应流程并给出清晰结果。"
+
+policy:
+  allow_implicit_invocation: true
