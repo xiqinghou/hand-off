@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression cases use disposable packages, never the live project or Git."""
+"""Regression cases use disposable packages/Git repos, never real credentials."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from validate_handoff import MANIFEST, RECEIPT, validate
+from validate_handoff import LOCAL_CONFIG, LOCAL_MANIFEST, MANIFEST, MUTABLE_FILES, RECEIPT, validate
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +64,32 @@ class HandoffValidationTests(unittest.TestCase):
         errors, _ = validate(self.root, scene, write_manifest)
         self.assertTrue(any(substring in item for item in errors), errors)
 
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", "-C", str(self.root.parent), *arguments],
+            capture_output=True, check=True,
+        )
+
+    def make_private_package(self):
+        self.git("init", "-q")
+        write(self.root.parent / ".gitignore", "/交接/配置交接/.codex/\n")
+        private = self.root / LOCAL_CONFIG
+        write(private / "config.toml", 'api_key = "' + "x" * 24 + '"\n')
+        write(private / "auth.json", json.dumps({"OPENAI_API_KEY": "x" * 24}))
+        write(private / "README.md", "# Local recovery\nCopy listed files after backup.\n")
+        write(private / "skills/hand-off/SKILL.md", "# hand-off\nPortable skill.\n")
+        manifest = self.root / "配置交接/文件清单.json"
+        data = json.loads(manifest.read_text())
+        data["files"].append({"path": ".codex/config.toml", "included": False,
+                              "transport": "local_only", "reason": "USB only"})
+        write(manifest, json.dumps(data))
+        return private
+
+    def generate_private(self):
+        errors, _ = validate(self.root, "device", True, True)
+        self.assertEqual(errors, [])
+        self.assertEqual(validate(self.root, "device", private_config=True)[0], [])
+
     def test_device_including_portable_skill(self):
         shutil.copytree(
             SKILL_ROOT, self.root / "配置交接/skills/hand-off",
@@ -74,6 +100,138 @@ class HandoffValidationTests(unittest.TestCase):
     def test_conversation_without_user_configuration(self):
         self.root = make_package(self.base / "conversation", "conversation")
         self.generate("conversation")
+
+    def test_legacy_manifest_still_valid(self):
+        self.generate()
+        path = self.root / MANIFEST
+        data = json.loads(path.read_text())
+        data["format"] = 1
+        data["excludes"] = sorted(MUTABLE_FILES)
+        write(path, json.dumps(data))
+        self.assertEqual(validate(self.root, "device")[0], [])
+
+    def test_private_key_bundle_and_cloud_only_receipt(self):
+        private = self.make_private_package()
+        self.generate_private()
+        data = json.loads((self.root / MANIFEST).read_text())
+        self.assertEqual(data["format"], 2)
+        self.assertFalse(any(entry["path"].startswith(LOCAL_CONFIG) for entry in data["files"]))
+        self.assertNotIn(hashlib.sha256((private / "config.toml").read_bytes()).hexdigest(),
+                         (self.root / MANIFEST).read_text())
+        shutil.rmtree(private)
+        self.assertEqual(validate(self.root, "device")[0], [])
+        errors, _ = validate(self.root, "device", private_config=True)
+        self.assertTrue(any("directory is missing" in error for error in errors))
+
+    def test_private_including_portable_skill(self):
+        private = self.make_private_package()
+        shutil.copytree(
+            SKILL_ROOT, private / "skills/hand-off", dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc", ".git"),
+        )
+        self.generate_private()
+
+    def test_private_hash_detects_change_without_invalidating_cloud(self):
+        private = self.make_private_package()
+        self.generate_private()
+        write(private / "config.toml", 'api_key = "' + "y" * 24 + '"\n')
+        self.assertEqual(validate(self.root, "device")[0], [])
+        errors, _ = validate(self.root, "device", private_config=True)
+        self.assertTrue(any("sha256 mismatch" in error for error in errors), errors)
+
+    def test_private_git_ignore_required(self):
+        self.make_private_package()
+        (self.root.parent / ".gitignore").unlink()
+        self.assert_error("not fully Git-ignored", write_manifest=True)
+        self.assertFalse((self.root / MANIFEST).exists())
+
+    def test_private_git_ignore_negation_is_checked_per_file(self):
+        self.make_private_package()
+        write(self.root.parent / ".gitignore",
+              "/交接/配置交接/.codex/*\n!/交接/配置交接/.codex/auth.json\n")
+        self.assert_error("not fully Git-ignored", write_manifest=True)
+
+    def test_tracked_private_config_blocked_even_if_deleted(self):
+        private = self.make_private_package()
+        self.git("add", "-f", "--", "交接/配置交接/.codex/auth.json")
+        self.assert_error("tracked or staged", write_manifest=True)
+        shutil.rmtree(private)
+        self.assert_error("tracked or staged", write_manifest=True)
+
+    def test_private_config_requires_git_boundary(self):
+        self.make_private_package()
+        shutil.rmtree(self.root.parent / ".git")
+        self.assert_error("requires a Git repository", write_manifest=True)
+
+    def test_private_metadata_and_skill_must_not_contain_secrets(self):
+        private = self.make_private_package()
+        self.generate_private()
+        before = (self.root / MANIFEST).read_bytes(), (private / LOCAL_MANIFEST).read_bytes()
+        for relative in ("README.md", "skills/hand-off/SKILL.md", LOCAL_MANIFEST):
+            path = private / relative
+            original = path.read_bytes()
+            write(path, 'api_key = "' + "x" * 24 + '"\n')
+            errors, _ = validate(self.root, "device", True, True)
+            self.assertTrue(any("private metadata" in error for error in errors), errors)
+            self.assertEqual(before[0], (self.root / MANIFEST).read_bytes())
+            if relative != LOCAL_MANIFEST:
+                self.assertEqual(before[1], (private / LOCAL_MANIFEST).read_bytes())
+            path.write_bytes(original)
+
+    def test_private_oauth_login_data_and_runtime_are_rejected(self):
+        private = self.make_private_package()
+        write(private / "auth.json", json.dumps({"OPENAI_API_KEY": "x" * 24,
+                                                 "tokens": {"refresh_token": "y" * 24}}))
+        write(private / "sessions/session.json", "{}")
+        errors, _ = validate(self.root, "device", True, True)
+        self.assertTrue(any("OAuth login state" in error for error in errors), errors)
+        self.assertTrue(any("runtime/login data" in error for error in errors), errors)
+        self.assertTrue(any("only API-key authentication" in error for error in errors), errors)
+        self.assertFalse((private / LOCAL_MANIFEST).exists())
+
+    def test_private_files_cannot_be_marked_for_cloud_upload(self):
+        self.make_private_package()
+        path = self.root / "配置交接/文件清单.json"
+        data = json.loads(path.read_text())
+        data["files"][-1]["included"] = True
+        write(path, json.dumps(data))
+        self.assert_error("must be excluded", write_manifest=True)
+
+    def test_private_archive_outside_exact_directory_is_scanned(self):
+        private = self.make_private_package()
+        shutil.copytree(private, self.root / "工作交接/归档/old/.codex")
+        self.assert_error("possible credential_assignment", write_manifest=True)
+
+    def test_private_root_symlink_is_not_read(self):
+        private = self.make_private_package()
+        external = self.base / "external-private"
+        shutil.move(str(private), external)
+        private.symlink_to(external, target_is_directory=True)
+        self.assert_error("symlink is not allowed", write_manifest=True)
+
+    def test_private_parent_symlink_is_not_read(self):
+        private = self.make_private_package()
+        write(private / "auth.json", json.dumps({"refresh_token": "x" * 24}))
+        external = self.base / "external-config"
+        shutil.move(str(private.parent), external)
+        private.parent.symlink_to(external, target_is_directory=True)
+        errors, _ = validate(self.root, "device", True, True)
+        self.assertTrue(any("symlink is not allowed" in error for error in errors), errors)
+        self.assertFalse(any("OAuth login state" in error for error in errors), errors)
+
+    def test_private_flag_not_allowed_in_conversation(self):
+        errors, _ = validate(self.root, "conversation", True, True)
+        self.assertEqual(errors, ["--private-config is only supported for device handoff"])
+
+    def test_private_manifest_not_regenerated_on_receipt(self):
+        private = self.make_private_package()
+        self.generate_private()
+        path = private / LOCAL_MANIFEST
+        write(path, "{")
+        before = path.read_bytes()
+        errors, _ = validate(self.root, "device", private_config=True)
+        self.assertTrue(any("invalid private validation manifest" in error for error in errors), errors)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_mutable_receipt_does_not_invalidate_manifest(self):
         self.generate()

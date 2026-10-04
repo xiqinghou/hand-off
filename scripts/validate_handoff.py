@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Local handoff validation. Only --write-manifest writes after checks pass.
 
-No Git commands, configuration collection, or network access. Hashes detect
-changes, not authenticity or business readiness. Requires Python 3.10+.
+Only read-only Git queries; no configuration collection or network access.
+Hashes detect changes, not authenticity or readiness. Requires Python 3.10+.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -29,10 +30,15 @@ COMMON_REQUIRED = (
 MANIFEST = "校验清单.json"
 RECEIPT = "工作交接/接收回执.md"
 MUTABLE_FILES = {MANIFEST, RECEIPT}
+LOCAL_CONFIG = "配置交接/.codex"
+LOCAL_MANIFEST = "文件清单.json"
+PUBLIC_EXCLUDES = MUTABLE_FILES | {LOCAL_CONFIG + "/"}
+FORBIDDEN_PRIVATE_DIRS = {"sessions", "logs", "cache", "history", "plugins", "browser"}
+OAUTH_FIELD = re.compile(r"(?i)[\"']?(?:refresh_token|id_token|access_token)[\"']?\s*[:=]")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 SECRET_PATTERNS = {
     "credential_assignment": re.compile(
-        r"""(?i)(?:[\w-]*(?:api[_-]?key|secret[_-]?key|access[_-]?token|password))"""
+        r"""(?i)(?:[\w-]*(?:api[_-]?key|secret[_-]?key|(?:access|refresh|id)[_-]?token|password))"""
         r"""['"]?\s*[:=]\s*['"]?([A-Za-z0-9_.+/=-]{16,})"""
     ),
     "bearer": re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{16,}"),
@@ -67,7 +73,7 @@ def safe_relative(value: object) -> bool:
     )
 
 
-def inventory(root: Path) -> tuple[dict[str, Path], list[str]]:
+def inventory(root: Path, excluded_tree: str | None = None) -> tuple[dict[str, Path], list[str]]:
     files: dict[str, Path] = {}
     errors: list[str] = []
 
@@ -81,6 +87,8 @@ def inventory(root: Path) -> tuple[dict[str, Path], list[str]]:
             if path.is_symlink():
                 errors.append(f"symlink is not allowed: {relative}")
                 directories.remove(name)
+            elif relative == excluded_tree:
+                directories.remove(name)
             elif name in {".git", "__pycache__", "node_modules"}:
                 errors.append(f"runtime/repository directory is not portable: {relative}")
                 directories.remove(name)
@@ -89,6 +97,8 @@ def inventory(root: Path) -> tuple[dict[str, Path], list[str]]:
             relative = path.relative_to(root).as_posix()
             if path.is_symlink():
                 errors.append(f"symlink is not allowed: {relative}")
+            elif relative == excluded_tree:
+                errors.append(f"private configuration root must be a directory: {relative}")
             elif not path.is_file():
                 errors.append(f"unsupported file type: {relative}")
             elif not safe_relative(relative):
@@ -98,6 +108,87 @@ def inventory(root: Path) -> tuple[dict[str, Path], list[str]]:
             else:
                 files[relative] = path
     return dict(sorted(files.items())), errors
+
+
+def check_private_git_boundary(root: Path, private_files: dict[str, Path]) -> list[str]:
+    """Ignore rules alone do not protect a file already in the index."""
+    private_root = root / LOCAL_CONFIG
+    repository_found = False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root.parent), "rev-parse", "--show-toplevel"],
+            capture_output=True, timeout=10, check=False,
+        )
+        if result.returncode:
+            return ["private configuration requires a Git repository with verified ignore rules"] if private_root.exists() else []
+        repository = Path(os.fsdecode(result.stdout.rstrip(b"\r\n"))).resolve()
+        repository_found = True
+        prefix = private_root.relative_to(repository).as_posix()
+        tracked = subprocess.run(
+            ["git", "-C", str(repository), "ls-files", "--cached", "-z", "--", ":(literal)" + prefix],
+            capture_output=True, timeout=10, check=False,
+        )
+        if tracked.returncode:
+            return ["cannot verify private configuration Git tracking status"]
+        if tracked.stdout:
+            return ["private configuration is tracked or staged; stop before upload"]
+        if not private_root.exists():
+            return []
+        candidates = [prefix + "/.handoff-ignore-probe"]
+        candidates.extend(prefix + "/" + relative for relative in private_files)
+        expected = {os.fsencode(path) for path in candidates}
+        ignored = subprocess.run(
+            ["git", "-C", str(repository), "check-ignore", "--no-index", "--stdin", "-z"],
+            input=b"\0".join(sorted(expected)) + b"\0",
+            capture_output=True, timeout=10, check=False,
+        )
+        if ignored.returncode not in (0, 1):
+            return ["cannot verify private configuration Git ignore rules"]
+        if set(ignored.stdout.split(b"\0")) - {b""} != expected:
+            return ["private configuration is not fully Git-ignored; set ignore rules before collection"]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ["cannot verify private configuration Git boundary"] if private_root.exists() or repository_found else []
+    return []
+
+
+def check_private_content(files: dict[str, Path]) -> list[str]:
+    errors: list[str] = []
+    for required in ("config.toml", "README.md", "skills/hand-off/SKILL.md"):
+        if required not in files:
+            errors.append(f"missing private configuration file: {required}")
+    for relative, path in files.items():
+        if set(PurePosixPath(relative).parts[:-1]) & FORBIDDEN_PRIVATE_DIRS:
+            errors.append(f"runtime/login data is not allowed in private configuration: {relative}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeError:
+            errors.append(f"private configuration must be UTF-8 for review: {relative}")
+            continue
+        if not text.strip():
+            errors.append(f"private configuration file is empty: {relative}")
+        credential_file = (
+            "/" not in relative and relative != LOCAL_MANIFEST
+            and (path.name == ".env" or path.suffix in {".toml", ".json", ".env", ".sh", ".ps1"})
+        )
+        for name, pattern in SECRET_PATTERNS.items():
+            if credential_file and name in {"credential_assignment", "bearer"}:
+                continue
+            if pattern.search(text):
+                errors.append(f"possible {name} in private metadata/unsupported credential: {relative}")
+        if credential_file and OAUTH_FIELD.search(text):
+            errors.append(f"OAuth login state is not allowed in private configuration: {relative}")
+    if "auth.json" in files:
+        data, auth_errors = read_json(files["auth.json"], "private API-key authentication")
+        errors.extend(auth_errors)
+        if not auth_errors and (
+            not isinstance(data, dict)
+            or set(data) - {"OPENAI_API_KEY", "auth_mode"}
+            or not isinstance(data.get("OPENAI_API_KEY"), str)
+            or not data["OPENAI_API_KEY"].strip()
+            or ("auth_mode" in data and data["auth_mode"] != "apikey")
+        ):
+            errors.append("private auth.json must contain only API-key authentication, not login state")
+    return errors
 
 
 def read_json(path: Path, label: str) -> tuple[object, list[str]]:
@@ -159,6 +250,9 @@ def check_config_manifest(files: dict[str, Path]) -> list[str]:
             errors.append(f"configuration manifest requires included=true/false: {relative}")
             continue
         package_path = "配置交接/" + relative
+        if relative == ".codex" or relative.startswith(".codex/"):
+            if entry["included"] or entry.get("transport") != "local_only" or "sha256" in entry:
+                errors.append(f"private configuration must be excluded with transport=local_only and no cloud hash: {relative}")
         if entry["included"]:
             if package_path not in files:
                 errors.append(f"included configuration file is missing or unsafe: {relative}")
@@ -176,10 +270,10 @@ def check_config_manifest(files: dict[str, Path]) -> list[str]:
 
 def build_manifest(scene: str, files: dict[str, Path]) -> dict:
     return {
-        "format": 1,
+        "format": 2,
         "scene": scene,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "excludes": sorted(MUTABLE_FILES),
+        "excludes": sorted(PUBLIC_EXCLUDES),
         "files": [
             {"path": relative, "size": path.stat().st_size, "sha256": sha256(path)}
             for relative, path in files.items() if relative not in MUTABLE_FILES
@@ -187,20 +281,37 @@ def build_manifest(scene: str, files: dict[str, Path]) -> dict:
     }
 
 
-def check_manifest(scene: str, files: dict[str, Path]) -> list[str]:
-    if MANIFEST not in files:
-        return [f"missing required file: {MANIFEST}"]
-    data, errors = read_json(files[MANIFEST], "validation manifest")
+def build_private_manifest(files: dict[str, Path]) -> dict:
+    return {
+        "format": 1,
+        "transport": "local_only",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "excludes": [LOCAL_MANIFEST],
+        "files": [
+            {"path": relative, "size": path.stat().st_size, "sha256": sha256(path)}
+            for relative, path in files.items() if relative != LOCAL_MANIFEST
+        ],
+    }
+
+
+def check_manifest(scene: str, files: dict[str, Path], private: bool = False) -> list[str]:
+    name = LOCAL_MANIFEST if private else MANIFEST
+    label = "private validation manifest" if private else "validation manifest"
+    if name not in files:
+        return [f"missing required file: {name}"]
+    data, errors = read_json(files[name], label)
     if errors:
         return errors
-    if (
-        not isinstance(data, dict)
-        or data.get("format") != 1
-        or data.get("scene") != scene
-        or data.get("excludes") != sorted(MUTABLE_FILES)
-        or not isinstance(data.get("files"), list)
-    ):
-        return ["invalid validation manifest format, scene, exclusions or files"]
+    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+        return [f"invalid {label} format or files"]
+    if private:
+        excludes = {LOCAL_MANIFEST}
+        valid = data.get("format") == 1 and data.get("transport") == "local_only"
+    else:
+        excludes = MUTABLE_FILES if data.get("format") == 1 else PUBLIC_EXCLUDES
+        valid = data.get("format") in (1, 2) and data.get("scene") == scene
+    if not valid or data.get("excludes") != sorted(excludes):
+        return [f"invalid {label} format, scene, exclusions or files"]
     recorded: dict[str, dict] = {}
     for index, entry in enumerate(data["files"]):
         if (
@@ -214,10 +325,10 @@ def check_manifest(scene: str, files: dict[str, Path]) -> list[str]:
             errors.append(f"invalid validation manifest entry: {index}")
             continue
         relative = entry["path"]
-        if relative in MUTABLE_FILES or relative in recorded:
+        if relative in excludes or relative in recorded or (not private and relative.startswith(LOCAL_CONFIG + "/")):
             errors.append(f"duplicate or excluded manifest entry: {relative}")
         recorded[relative] = entry
-    actual = {key: value for key, value in files.items() if key not in MUTABLE_FILES}
+    actual = {key: value for key, value in files.items() if key not in excludes}
     for relative in sorted(set(recorded) - set(actual)):
         errors.append(f"file removed since manifest: {relative}")
     for relative in sorted(set(actual) - set(recorded)):
@@ -230,12 +341,29 @@ def check_manifest(scene: str, files: dict[str, Path]) -> list[str]:
     return errors
 
 
-def validate(root: Path, scene: str, write_manifest: bool = False) -> tuple[list[str], list[str]]:
+def validate(
+    root: Path, scene: str, write_manifest: bool = False, private_config: bool = False,
+) -> tuple[list[str], list[str]]:
+    if private_config and scene != "device":
+        return ["--private-config is only supported for device handoff"], []
     if root.is_symlink() or not root.is_dir():
         return ["package root must be an existing directory, not a symlink"], []
     root = root.resolve()
-    files, errors = inventory(root)
+    files, errors = inventory(root, excluded_tree=LOCAL_CONFIG)
     warnings: list[str] = []
+    private_root = root / LOCAL_CONFIG
+    private_files: dict[str, Path] = {}
+    safe_private_root = not any(path.is_symlink() for path in (private_root.parent, private_root))
+    if safe_private_root and private_root.is_dir():
+        private_files, private_errors = inventory(private_root)
+        errors.extend("private configuration: " + error for error in private_errors)
+        if private_config:
+            errors.extend(check_private_content(private_files))
+        else:
+            warnings.append("local private configuration excluded from cloud validation; use --private-config to verify its content and hashes")
+    elif private_config:
+        errors.append("private configuration directory is missing or unsafe")
+    errors.extend(check_private_git_boundary(root, private_files))
     required = COMMON_REQUIRED + (("配置交接/文件清单.json",) if scene == "device" else ())
     for relative in required:
         if relative not in files:
@@ -269,19 +397,25 @@ def validate(root: Path, scene: str, write_manifest: bool = False) -> tuple[list
         errors.extend(check_config_manifest(files))
 
     if write_manifest:
-        if not errors:
-            destination = root / MANIFEST
-            temporary = root / ".校验清单.json.tmp"
+        destinations = [(root / MANIFEST, build_manifest(scene, files))] if not errors else []
+        if private_config and not errors:
+            destinations.append((private_root / LOCAL_MANIFEST, build_private_manifest(private_files)))
+        for destination, _ in destinations:
+            temporary = destination.with_name("." + destination.name + ".tmp")
             if temporary.exists() or temporary.is_symlink():
                 errors.append("temporary manifest path already exists; leave it untouched")
-            else:
-                temporary.write_text(
-                    json.dumps(build_manifest(scene, files), ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+        if not errors:
+            for destination, data in destinations:
+                temporary = destination.with_name("." + destination.name + ".tmp")
+                with temporary.open("x", encoding="utf-8") as handle:
+                    if destination.parent == private_root and os.name == "posix":
+                        os.chmod(temporary, 0o600)
+                    handle.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
                 temporary.replace(destination)
     else:
         errors.extend(check_manifest(scene, files))
+        if private_config:
+            errors.extend(check_manifest(scene, private_files, private=True))
     return errors, warnings
 
 
@@ -290,9 +424,10 @@ def main() -> int:
     parser.add_argument("root", type=Path)
     parser.add_argument("--scene", choices=("device", "conversation"), default="device")
     parser.add_argument("--write-manifest", action="store_true", help="outgoing only; never use on receipt")
+    parser.add_argument("--private-config", action="store_true", help="also verify the local-only API-key recovery bundle")
     args = parser.parse_args()
     try:
-        errors, warnings = validate(args.root.expanduser(), args.scene, args.write_manifest)
+        errors, warnings = validate(args.root.expanduser(), args.scene, args.write_manifest, args.private_config)
     except OSError as exc:
         print(f"FAIL: filesystem operation failed ({type(exc).__name__})", file=sys.stderr)
         return 2
